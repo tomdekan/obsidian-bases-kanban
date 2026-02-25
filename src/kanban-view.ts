@@ -44,6 +44,10 @@ export class KanbanView extends BasesView {
 		this.scrollEl = scrollEl;
 		this.plugin = plugin;
 		this.containerEl = scrollEl.createDiv({ cls: 'bases-kanban-container' });
+		this.containerEl.tabIndex = 0;
+		this.containerEl.addEventListener('keydown', (evt) => {
+			void this.handleBoardKeydown(evt);
+		});
 
 		// Initialize drag & drop manager with callbacks
 		this.dragDropManager = new DragDropManager(this.app, {
@@ -112,6 +116,7 @@ export class KanbanView extends BasesView {
 		});
 
 		boardEl.addEventListener('click', (evt) => {
+			this.containerEl.focus({ preventScroll: true });
 			const target = evt.target as HTMLElement | null;
 			if (!target?.closest('.bases-kanban-card')) {
 				this.dragDropManager.clearCardSelection();
@@ -238,9 +243,8 @@ export class KanbanView extends BasesView {
 		cardEl.dataset.columnName = columnName;
 		cardEl.dataset.cardIndex = String(cardIndex);
 
-		// Card title + actions
-		const titleRowEl = cardEl.createDiv({ cls: 'bases-kanban-card-title-row' });
-		const titleEl = titleRowEl.createDiv({ cls: 'bases-kanban-card-title' });
+		// Card title (always file name)
+		const titleEl = cardEl.createDiv({ cls: 'bases-kanban-card-title' });
 		const filePath = entry.file.path;
 		
 		const link = titleEl.createEl('a', { 
@@ -250,17 +254,6 @@ export class KanbanView extends BasesView {
 		link.addEventListener('click', (evt) => {
 			evt.preventDefault();
 			void this.app.workspace.openLinkText(filePath, '', evt.ctrlKey || evt.metaKey);
-		});
-
-		const deleteBtn = titleRowEl.createEl('button', {
-			cls: 'bases-kanban-card-delete-btn clickable-icon',
-			attr: { 'aria-label': `Delete card ${entry.file.basename}` },
-		});
-		setIcon(deleteBtn, 'trash-2');
-		deleteBtn.addEventListener('click', (evt) => {
-			evt.preventDefault();
-			evt.stopPropagation();
-			void this.handleDeleteCardSelection(entry);
 		});
 
 		// Render visible properties from the Properties panel
@@ -284,22 +277,43 @@ export class KanbanView extends BasesView {
 		this.dragDropManager.makeCardDraggable(cardEl, entry, columnName, cardIndex);
 	}
 
-	private async handleDeleteCardSelection(clickedEntry: BasesEntry): Promise<void> {
-		const selectedPaths = new Set(this.dragDropManager.getSelectedCardPaths());
-		const selectedIncludesClicked = selectedPaths.has(clickedEntry.file.path);
-		const entriesToDelete = selectedIncludesClicked
-			? this.getEntriesInBoardOrder().filter((entry) => selectedPaths.has(entry.file.path))
-			: [clickedEntry];
-		const uniqueEntries = entriesToDelete.length > 0 ? entriesToDelete : [clickedEntry];
-		const count = uniqueEntries.length;
+	private async handleBoardKeydown(evt: KeyboardEvent): Promise<void> {
+		if (evt.key !== 'Backspace') {
+			return;
+		}
+		const target = evt.target as HTMLElement | null;
+		if (target && ['INPUT', 'TEXTAREA'].includes(target.tagName)) {
+			return;
+		}
+
+		const selectedPaths = this.dragDropManager.getSelectedCardPaths();
+		if (selectedPaths.length === 0) {
+			return;
+		}
+
+		evt.preventDefault();
+		evt.stopPropagation();
+		await this.deleteSelectedCards();
+	}
+
+	private async deleteSelectedCards(): Promise<void> {
+		const selectedPathSet = new Set(this.dragDropManager.getSelectedCardPaths());
+		const entriesToDelete = this.getEntriesInBoardOrder().filter((entry) =>
+			selectedPathSet.has(entry.file.path)
+		);
+		if (entriesToDelete.length === 0) {
+			return;
+		}
+
+		const count = entriesToDelete.length;
 		const message = count === 1
-			? `Delete "${clickedEntry.file.basename}"?`
+			? `Delete "${entriesToDelete[0].file.basename}"?`
 			: `Delete ${count} selected cards?`;
 		if (!window.confirm(message)) {
 			return;
 		}
 
-		for (const entry of uniqueEntries) {
+		for (const entry of entriesToDelete) {
 			await this.app.fileManager.trashFile(entry.file);
 		}
 
