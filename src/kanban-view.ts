@@ -48,11 +48,9 @@ export class KanbanView extends BasesView {
 		// Initialize drag & drop manager with callbacks
 		this.dragDropManager = new DragDropManager(this.app, {
 			onColumnReorder: (newOrder) => this.handleColumnReorder(newOrder),
-			onCardMoveToColumn: (file, newValue) => this.handleCardMoveToColumn(file, newValue),
-			onCardReorder: (file, columnName, targetIndex) => this.handleCardReorder(file, columnName, targetIndex),
+			onCardDrop: (files, sourceColumnName, targetColumnName, targetIndex) =>
+				this.handleCardDrop(files, sourceColumnName, targetColumnName, targetIndex),
 			getColumnNames: () => this.getCurrentColumnNames(),
-			getGroupByProperty: () => this.getGroupByPropertyFromConfig(),
-			getSortProperty: () => this.getSortPropertyFromConfig(),
 		});
 	}
 
@@ -95,8 +93,11 @@ export class KanbanView extends BasesView {
 		// Detect the groupBy property from the data (uses Bases groupBy configuration)
 		this.groupByProperty = this.detectGroupByProperty(groupedData);
 
-		// Sort groups by saved column order
-		const sortedGroups = this.sortGroupsByColumnOrder(groupedData);
+		// Include empty columns saved in column order, then sort and hide deleted empties
+		const groupsWithEmptyColumns = this.mergeWithEmptyColumnsFromOrder(groupedData);
+		const sortedGroups = this.filterHiddenEmptyColumns(
+			this.sortGroupsByColumnOrder(groupsWithEmptyColumns)
+		);
 		this.currentGroups = sortedGroups;
 
 		// Render the kanban board
@@ -108,6 +109,13 @@ export class KanbanView extends BasesView {
 		// Render columns with their index for drag & drop
 		sortedGroups.forEach((group, columnIndex) => {
 			this.renderColumn(boardEl, group, columnIndex);
+		});
+
+		boardEl.addEventListener('click', (evt) => {
+			const target = evt.target as HTMLElement | null;
+			if (!target?.closest('.bases-kanban-card')) {
+				this.dragDropManager.clearCardSelection();
+			}
 		});
 
 		// Add the "Add Column" button at the end
@@ -172,6 +180,19 @@ export class KanbanView extends BasesView {
 			});
 		}
 
+		// Allow deleting empty columns from the board's saved layout
+		if (!isNoValueColumn && group.entries.length === 0) {
+			const deleteColumnBtn = headerRightEl.createEl('button', {
+				cls: 'bases-kanban-delete-column-btn clickable-icon',
+				attr: { 'aria-label': `Delete empty column ${columnName}` }
+			});
+			setIcon(deleteColumnBtn, 'trash-2');
+			deleteColumnBtn.addEventListener('click', (evt) => {
+				evt.stopPropagation();
+				this.handleDeleteEmptyColumn(columnName);
+			});
+		}
+
 		// Make column draggable
 		this.dragDropManager.makeColumnDraggable(columnEl, columnName, columnIndex);
 
@@ -210,6 +231,7 @@ export class KanbanView extends BasesView {
 
 	private renderCard(container: HTMLElement, entry: BasesEntry, columnName: string, cardIndex: number): void {
 		const cardEl = container.createDiv({ cls: 'bases-kanban-card' });
+		(cardEl as HTMLElement & { _basesEntry?: BasesEntry })._basesEntry = entry;
 
 		// Store data attributes for drag & drop
 		cardEl.dataset.filePath = entry.file.path;
@@ -362,8 +384,14 @@ export class KanbanView extends BasesView {
 		}
 
 		const modal = new AddColumnModal(this.app, this.data?.data ?? [], (columnValue, selectedFiles) => {
-			if (!columnValue || selectedFiles.length === 0) return;
-			void this.addColumnToFiles(groupByProperty, columnValue, selectedFiles);
+			if (!columnValue) return;
+
+			this.ensureColumnInOrder(columnValue);
+			this.render();
+
+			if (selectedFiles.length > 0) {
+				void this.addColumnToFiles(groupByProperty, columnValue, selectedFiles);
+			}
 		});
 		modal.open();
 	}
@@ -405,6 +433,61 @@ export class KanbanView extends BasesView {
 	 */
 	private handleColumnReorder(newOrder: string[]): void {
 		this.updateColumnOrder(newOrder);
+	}
+
+	/**
+	 * Handle single or multi-card drop operation (move across columns and/or reorder)
+	 */
+	private async handleCardDrop(
+		files: TFile[],
+		sourceColumnName: string,
+		targetColumnName: string,
+		targetIndex: number
+	): Promise<void> {
+		if (files.length === 0) return;
+
+		const selectedPaths = new Set(files.map((file) => file.path));
+		const orderedSelectedEntries = this.getEntriesInBoardOrder().filter((entry) => selectedPaths.has(entry.file.path));
+		if (orderedSelectedEntries.length === 0) return;
+
+		const sortProperty = this.getSortPropertyFromConfig();
+		const selectedColumnNames = new Set(orderedSelectedEntries.map((entry) => this.getColumnNameForEntry(entry)));
+		const isSingleColumnSelection = selectedColumnNames.size === 1;
+		const isPureSameColumnReorder =
+			isSingleColumnSelection &&
+			selectedColumnNames.has(targetColumnName) &&
+			sourceColumnName === targetColumnName;
+
+		if (isPureSameColumnReorder) {
+			if (!sortProperty) return;
+			await this.handleCardsReorderWithinColumn(orderedSelectedEntries, targetColumnName, targetIndex, sortProperty);
+			return;
+		}
+
+		const groupByProperty = this.getGroupByPropertyFromConfig();
+		if (!groupByProperty) {
+			new Notice('Could not detect the group by property. Ensure cards have frontmatter for the grouped property.');
+			return;
+		}
+
+		const newColumnValue = targetColumnName === NO_VALUE_COLUMN ? '' : targetColumnName;
+		await Promise.all(
+			files.map((file) =>
+				this.app.fileManager.processFrontMatter(file, (fm) => {
+					if (newColumnValue === '') {
+						delete fm[groupByProperty];
+					} else {
+						fm[groupByProperty] = newColumnValue;
+					}
+				})
+			)
+		);
+
+		if (!sortProperty) {
+			return;
+		}
+
+		await this.renumberColumnsAfterBatchMove(orderedSelectedEntries, targetColumnName, targetIndex, sortProperty);
 	}
 
 	/**
@@ -462,6 +545,90 @@ export class KanbanView extends BasesView {
 
 		// Renumber all cards with clean integers
 		await this.renumberCardsInOrder(newOrder, sortProperty, isDescending);
+	}
+
+	private async handleCardsReorderWithinColumn(
+		movedEntries: BasesEntry[],
+		columnName: string,
+		targetIndex: number,
+		sortProperty: string
+	): Promise<void> {
+		const group = this.currentGroups.find(g => this.getColumnName(g.key) === columnName);
+		if (!group) return;
+
+		const movedPathSet = new Set(movedEntries.map((entry) => entry.file.path));
+		const remainingEntries = group.entries.filter((entry) => !movedPathSet.has(entry.file.path));
+
+		const movedBeforeTarget = group.entries
+			.slice(0, targetIndex)
+			.filter((entry) => movedPathSet.has(entry.file.path)).length;
+		const adjustedTargetIndex = Math.max(0, Math.min(remainingEntries.length, targetIndex - movedBeforeTarget));
+
+		const newOrder: BasesEntry[] = [
+			...remainingEntries.slice(0, adjustedTargetIndex),
+			...movedEntries.filter((entry) => this.getColumnNameForEntry(entry) === columnName),
+			...remainingEntries.slice(adjustedTargetIndex),
+		];
+
+		const isDescending = this.getSortDirection() === 'DESC';
+		await this.renumberCardsInOrder(newOrder, sortProperty, isDescending);
+	}
+
+	private async renumberColumnsAfterBatchMove(
+		movedEntries: BasesEntry[],
+		targetColumnName: string,
+		targetIndex: number,
+		sortProperty: string
+	): Promise<void> {
+		const movedPathSet = new Set(movedEntries.map((entry) => entry.file.path));
+		const targetGroup = this.currentGroups.find((group) => this.getColumnName(group.key) === targetColumnName);
+		const targetOriginalEntries = targetGroup?.entries ?? [];
+
+		const selectedAlreadyInTargetBeforeIndex = targetOriginalEntries
+			.slice(0, targetIndex)
+			.filter((entry) => movedPathSet.has(entry.file.path)).length;
+		const adjustedTargetIndex = Math.max(
+			0,
+			Math.min(
+				targetOriginalEntries.filter((entry) => !movedPathSet.has(entry.file.path)).length,
+				targetIndex - selectedAlreadyInTargetBeforeIndex
+			)
+		);
+
+		const targetRemainingEntries = targetOriginalEntries.filter((entry) => !movedPathSet.has(entry.file.path));
+		const newTargetOrder: BasesEntry[] = [
+			...targetRemainingEntries.slice(0, adjustedTargetIndex),
+			...movedEntries,
+			...targetRemainingEntries.slice(adjustedTargetIndex),
+		];
+
+		const isDescending = this.getSortDirection() === 'DESC';
+		const updates: Promise<void>[] = [];
+		const affectedSourceColumns = new Set(movedEntries.map((entry) => this.getColumnNameForEntry(entry)));
+
+		for (const columnName of affectedSourceColumns) {
+			if (columnName === targetColumnName) continue;
+			const group = this.currentGroups.find((g) => this.getColumnName(g.key) === columnName);
+			if (!group) continue;
+			const sourceRemaining = group.entries.filter((entry) => !movedPathSet.has(entry.file.path));
+			updates.push(this.renumberCardsInOrder(sourceRemaining, sortProperty, isDescending));
+		}
+
+		updates.push(this.renumberCardsInOrder(newTargetOrder, sortProperty, isDescending));
+		await Promise.all(updates);
+	}
+
+	private getEntriesInBoardOrder(): BasesEntry[] {
+		return this.currentGroups.flatMap((group) => group.entries);
+	}
+
+	private getColumnNameForEntry(entry: BasesEntry): string {
+		for (const group of this.currentGroups) {
+			if (group.entries.some((candidate) => candidate.file.path === entry.file.path)) {
+				return this.getColumnName(group.key);
+			}
+		}
+		return NO_VALUE_COLUMN;
 	}
 
 	/**
@@ -604,6 +771,66 @@ export class KanbanView extends BasesView {
 		return [];
 	}
 
+	private getHiddenEmptyColumnsFromConfig(): string[] {
+		const configValue = this.config?.get('hiddenEmptyColumns');
+		if (typeof configValue === 'string' && configValue.length > 0) {
+			return configValue.split(',').map(s => s.trim()).filter(s => s.length > 0);
+		}
+		if (Array.isArray(configValue)) {
+			return configValue.filter((v): v is string => typeof v === 'string');
+		}
+		return [];
+	}
+
+	/**
+	 * Ensure a column name exists in persisted column order.
+	 */
+	private ensureColumnInOrder(columnName: string): void {
+		if (!columnName || columnName === NO_VALUE_COLUMN) {
+			return;
+		}
+
+		// Re-adding a previously deleted empty column should make it visible again.
+		const hidden = new Set(this.getHiddenEmptyColumnsFromConfig());
+		if (hidden.delete(columnName)) {
+			this.config?.set('hiddenEmptyColumns', Array.from(hidden).join(','));
+		}
+
+		const columnOrder = this.getColumnOrderFromConfig();
+		if (columnOrder.includes(columnName)) {
+			return;
+		}
+
+		this.updateColumnOrder([...columnOrder, columnName]);
+	}
+
+	/**
+	 * Add synthetic empty groups for columns that exist in saved order but have no cards.
+	 */
+	private mergeWithEmptyColumnsFromOrder(groups: BasesEntryGroup[]): BasesEntryGroup[] {
+		const columnOrder = this.getColumnOrderFromConfig();
+		if (columnOrder.length === 0) {
+			return groups;
+		}
+
+		const existingNames = new Set(groups.map(group => this.getColumnName(group.key)));
+		const emptyGroups: BasesEntryGroup[] = [];
+
+		for (const columnName of columnOrder) {
+			if (!columnName || columnName === NO_VALUE_COLUMN || existingNames.has(columnName)) {
+				continue;
+			}
+
+			emptyGroups.push({
+				key: { toString: () => columnName } as Value,
+				entries: [],
+				hasKey: () => true,
+			} as BasesEntryGroup);
+		}
+
+		return [...groups, ...emptyGroups];
+	}
+
 	/**
 	 * Sort groups based on saved column order
 	 */
@@ -631,6 +858,16 @@ export class KanbanView extends BasesView {
 		});
 	}
 
+	private filterHiddenEmptyColumns(groups: BasesEntryGroup[]): BasesEntryGroup[] {
+		const hidden = new Set(this.getHiddenEmptyColumnsFromConfig());
+		if (hidden.size === 0) return groups;
+		return groups.filter((group) => {
+			const columnName = this.getColumnName(group.key);
+			const isEmpty = group.entries.length === 0;
+			return !(isEmpty && hidden.has(columnName));
+		});
+	}
+
 	/**
 	 * Update column order in config
 	 */
@@ -638,6 +875,24 @@ export class KanbanView extends BasesView {
 		// Store as comma-separated string for TextOption compatibility
 		const orderString = newOrder.join(',');
 		this.config?.set('columnOrder', orderString);
+	}
+
+	private handleDeleteEmptyColumn(columnName: string): void {
+		const group = this.currentGroups.find((g) => this.getColumnName(g.key) === columnName);
+		if (!group || group.entries.length > 0) {
+			new Notice('Only empty columns can be deleted.');
+			return;
+		}
+
+		const newOrder = this.getColumnOrderFromConfig().filter((name) => name !== columnName);
+		this.updateColumnOrder(newOrder);
+
+		const hidden = new Set(this.getHiddenEmptyColumnsFromConfig());
+		hidden.add(columnName);
+		this.config?.set('hiddenEmptyColumns', Array.from(hidden).join(','));
+
+		this.render();
+		new Notice(`Deleted empty column "${columnName}"`);
 	}
 
 	/**
@@ -657,6 +912,14 @@ export class KanbanView extends BasesView {
 				default: '',
 				placeholder: 'Managed by drag & drop',
 				// Hide this option as it's managed automatically
+				shouldHide: () => true,
+			},
+			{
+				key: 'hiddenEmptyColumns',
+				displayName: 'Hidden empty columns',
+				type: 'text' as const,
+				default: '',
+				placeholder: 'Managed by drag & drop',
 				shouldHide: () => true,
 			},
 		];
@@ -786,17 +1049,15 @@ class AddColumnModal extends Modal {
 			.addButton(btn => btn
 				.setButtonText('Create column')
 				.setCta()
-				.onClick(() => {
-					const value = this.columnValueInput.value.trim();
-					if (value && this.selectedFiles.size > 0) {
-						this.onSubmit(value, Array.from(this.selectedFiles));
-						this.close();
-					} else if (!value) {
-						new Notice('Please enter a column name');
-					} else {
-						new Notice('Please select at least one file');
-					}
-				}))
+					.onClick(() => {
+						const value = this.columnValueInput.value.trim();
+						if (value) {
+							this.onSubmit(value, Array.from(this.selectedFiles));
+							this.close();
+						} else if (!value) {
+							new Notice('Please enter a column name');
+						}
+					}))
 			.addButton(btn => btn
 				.setButtonText('Cancel')
 				.onClick(() => this.close()));
