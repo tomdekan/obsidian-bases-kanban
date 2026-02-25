@@ -781,17 +781,28 @@ export class KanbanView extends BasesView {
 	}
 
 	private getConfiguredGroupByProperty(): string | null {
+		const propertyId = this.config?.getAsPropertyId('groupBy');
+		if (propertyId?.startsWith('note.')) {
+			return propertyId.substring(5);
+		}
+
+		const directProperty = this.config?.get('groupBy.property');
+		if (typeof directProperty === 'string' && directProperty.length > 0) {
+			return directProperty.startsWith('note.') ? directProperty.substring(5) : directProperty;
+		}
+
 		const groupByConfig = this.config?.get('groupBy');
-		if (!groupByConfig || typeof groupByConfig !== 'object') {
-			return null;
+		if (typeof groupByConfig === 'string' && groupByConfig.length > 0) {
+			return groupByConfig.startsWith('note.') ? groupByConfig.substring(5) : groupByConfig;
+		}
+		if (groupByConfig && typeof groupByConfig === 'object') {
+			const propertyValue = (groupByConfig as { property?: unknown }).property;
+			if (typeof propertyValue === 'string' && propertyValue.length > 0) {
+				return propertyValue.startsWith('note.') ? propertyValue.substring(5) : propertyValue;
+			}
 		}
 
-		const propertyValue = (groupByConfig as { property?: unknown }).property;
-		if (typeof propertyValue !== 'string' || propertyValue.length === 0) {
-			return null;
-		}
-
-		return propertyValue.startsWith('note.') ? propertyValue.substring(5) : propertyValue;
+		return null;
 	}
 
 	/**
