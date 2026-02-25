@@ -81,12 +81,17 @@ export class KanbanView extends BasesView {
 		// Get grouped data - this uses the Bases groupBy configuration
 		const groupedData = this.data?.groupedData ?? [];
 		
-		// Check if we have groups (meaning groupBy is configured)
-		const hasGroupBy = groupedData.length > 1 || 
-			(groupedData.length === 1 && groupedData[0].key !== undefined && !(groupedData[0].key instanceof NullValue));
+		// Include empty columns saved in column order, then sort and hide deleted empties
+		const groupsWithEmptyColumns = this.mergeWithEmptyColumnsFromOrder(groupedData);
+		const sortedGroups = this.filterHiddenEmptyColumns(
+			this.sortGroupsByColumnOrder(groupsWithEmptyColumns)
+		);
 
-		if (!hasGroupBy && groupedData.length <= 1) {
-			// No groupBy configured - show helpful message
+		// Check if we have groups (meaning groupBy is configured), or at least saved empty columns
+		const hasGroupBy = groupedData.length > 1 ||
+			(groupedData.length === 1 && groupedData[0].key !== undefined && !(groupedData[0].key instanceof NullValue));
+		if (!hasGroupBy && sortedGroups.length === 0) {
+			// No groupBy configured and no saved columns to render
 			this.containerEl.createEl('p', {
 				text: 'Set "Group by" in the sort menu to organize cards into columns.',
 				cls: 'bases-kanban-placeholder'
@@ -96,12 +101,6 @@ export class KanbanView extends BasesView {
 
 		// Detect the groupBy property from the data (uses Bases groupBy configuration)
 		this.groupByProperty = this.detectGroupByProperty(groupedData);
-
-		// Include empty columns saved in column order, then sort and hide deleted empties
-		const groupsWithEmptyColumns = this.mergeWithEmptyColumnsFromOrder(groupedData);
-		const sortedGroups = this.filterHiddenEmptyColumns(
-			this.sortGroupsByColumnOrder(groupsWithEmptyColumns)
-		);
 		this.currentGroups = sortedGroups;
 
 		// Render the kanban board
