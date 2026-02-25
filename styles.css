@@ -126,6 +126,14 @@ body {
 	color: var(--text-accent);
 }
 
+.bases-kanban-delete-column-btn {
+	color: var(--text-error);
+}
+
+.bases-kanban-delete-column-btn:hover {
+	background-color: color-mix(in srgb, var(--text-error) 12%, transparent);
+}
+
 /* Cards container - scrolls independently */
 .bases-kanban-cards {
 	flex: 1;
@@ -151,6 +159,12 @@ body {
 .bases-kanban-card:hover {
 	border-color: var(--background-modifier-border-hover);
 	box-shadow: var(--shadow-s);
+}
+
+.bases-kanban-card.is-selected {
+	border-color: var(--interactive-accent);
+	box-shadow: 0 0 0 1px var(--interactive-accent);
+	background-color: color-mix(in srgb, var(--interactive-accent) 7%, var(--kanban-card-bg));
 }
 
 /* Card title */
@@ -392,6 +406,11 @@ body {
 
 .bases-kanban-card.bases-kanban-dragging {
 	background-color: var(--background-primary-alt);
+}
+
+.bases-kanban-card.bases-kanban-multi-drag-peer {
+	opacity: 0.75;
+	border-color: var(--interactive-accent);
 }
 
 /* Drag over state for columns */

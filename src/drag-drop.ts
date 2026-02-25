@@ -1,4 +1,4 @@
-import { App, TFile, Notice } from 'obsidian';
+import { App, TFile } from 'obsidian';
 import type { BasesEntry } from 'obsidian';
 
 /**
@@ -14,6 +14,8 @@ export interface DragState {
 	// For cards
 	entry?: BasesEntry;
 	filePath?: string;
+	entries?: BasesEntry[];
+	filePaths?: string[];
 }
 
 export interface DropTarget {
@@ -25,11 +27,8 @@ export interface DropTarget {
 
 export interface DragDropCallbacks {
 	onColumnReorder: (newOrder: string[]) => void;
-	onCardMoveToColumn: (file: TFile, newColumnValue: string) => Promise<void>;
-	onCardReorder: (file: TFile, targetColumnName: string, targetIndex: number) => Promise<void>;
+	onCardDrop: (files: TFile[], sourceColumnName: string, targetColumnName: string, targetIndex: number) => Promise<void>;
 	getColumnNames: () => string[];
-	getGroupByProperty: () => string | null;
-	getSortProperty: () => string | null;
 }
 
 /**
@@ -41,6 +40,9 @@ export class DragDropManager {
 	private dragState: DragState | null = null;
 	private dropIndicator: HTMLElement | null = null;
 	private boardEl: HTMLElement | null = null;
+	private selectedCardPaths = new Set<string>();
+	private selectedCardElements = new Map<string, HTMLElement>();
+	private lastSelectedCardPath: string | null = null;
 
 	constructor(app: App, callbacks: DragDropCallbacks) {
 		this.app = app;
@@ -52,6 +54,7 @@ export class DragDropManager {
 	 */
 	public initBoard(boardEl: HTMLElement): void {
 		this.boardEl = boardEl;
+		this.selectedCardElements.clear();
 		this.createDropIndicator();
 	}
 
@@ -63,6 +66,9 @@ export class DragDropManager {
 		this.dropIndicator = null;
 		this.boardEl = null;
 		this.dragState = null;
+		this.selectedCardElements.clear();
+		this.selectedCardPaths.clear();
+		this.lastSelectedCardPath = null;
 	}
 
 	/**
@@ -106,9 +112,11 @@ export class DragDropManager {
 		columnName: string,
 		cardIndex: number
 	): void {
+		this.selectedCardElements.set(entry.file.path, cardEl);
 		cardEl.setAttribute('draggable', 'true');
 		cardEl.classList.add('bases-kanban-draggable');
 
+		cardEl.addEventListener('click', (e) => this.handleCardClick(e, cardEl, entry));
 		cardEl.addEventListener('dragstart', (e) => this.handleCardDragStart(e, cardEl, entry, columnName, cardIndex));
 		cardEl.addEventListener('dragend', (e) => this.handleDragEnd(e));
 		cardEl.addEventListener('dragover', (e) => this.handleCardDragOver(e, cardEl, columnName, cardIndex));
@@ -122,6 +130,12 @@ export class DragDropManager {
 		cardsEl.addEventListener('dragover', (e) => this.handleCardsContainerDragOver(e, cardsEl, columnName));
 		cardsEl.addEventListener('dragleave', (e) => this.handleDragLeave(e, cardsEl));
 		cardsEl.addEventListener('drop', (e) => this.handleCardsContainerDrop(e, columnName));
+	}
+
+	public clearCardSelection(): void {
+		this.selectedCardPaths.clear();
+		this.lastSelectedCardPath = null;
+		this.syncSelectedCardClasses();
 	}
 
 	// ==================== Column Drag Handlers ====================
@@ -231,6 +245,17 @@ export class DragDropManager {
 		// Stop propagation to prevent column drag
 		e.stopPropagation();
 
+		const cardFilePath = entry.file.path;
+		const isSelected = this.selectedCardPaths.has(cardFilePath);
+		if (!isSelected) {
+			this.selectedCardPaths.clear();
+			this.selectedCardPaths.add(cardFilePath);
+			this.lastSelectedCardPath = cardFilePath;
+			this.syncSelectedCardClasses();
+		}
+
+		const selectedEntries = this.getSelectedEntriesForDrag(entry);
+
 		this.dragState = {
 			type: 'card',
 			sourceColumnName: columnName,
@@ -238,6 +263,8 @@ export class DragDropManager {
 			element: cardEl,
 			entry: entry,
 			filePath: entry.file.path,
+			entries: selectedEntries,
+			filePaths: selectedEntries.map((selected) => selected.file.path),
 		};
 
 		e.dataTransfer.effectAllowed = 'move';
@@ -245,6 +272,12 @@ export class DragDropManager {
 
 		requestAnimationFrame(() => {
 			cardEl.classList.add('bases-kanban-dragging');
+			if (selectedEntries.length > 1) {
+				selectedEntries.forEach((selected) => {
+					if (selected.file.path === entry.file.path) return;
+					this.selectedCardElements.get(selected.file.path)?.classList.add('bases-kanban-multi-drag-peer');
+				});
+			}
 		});
 	}
 
@@ -281,7 +314,7 @@ export class DragDropManager {
 
 		if (!this.dragState || this.dragState.type !== 'card') return;
 
-		const { entry, sourceColumnName, sourceIndex } = this.dragState;
+		const { entry, entries, sourceColumnName } = this.dragState;
 		if (!entry) return;
 
 		// Determine actual insert position
@@ -295,7 +328,7 @@ export class DragDropManager {
 		}
 
 		// Handle the drop
-		void this.processCardDrop(entry, sourceColumnName, targetColumnName, sourceIndex, insertIndex);
+		void this.processCardDrop(entries ?? [entry], sourceColumnName, targetColumnName, insertIndex);
 		this.clearDragState();
 	}
 
@@ -328,51 +361,32 @@ export class DragDropManager {
 
 		if (!this.dragState || this.dragState.type !== 'card') return;
 
-		const { entry, sourceColumnName, sourceIndex } = this.dragState;
+		const { entry, entries, sourceColumnName } = this.dragState;
 		if (!entry) return;
 
 		// Get number of cards in target column to insert at end
 		const cardsEl = e.currentTarget as HTMLElement;
 		const cardCount = cardsEl.querySelectorAll('.bases-kanban-card').length;
 
-		void this.processCardDrop(entry, sourceColumnName, targetColumnName, sourceIndex, cardCount);
+		void this.processCardDrop(entries ?? [entry], sourceColumnName, targetColumnName, cardCount);
 		this.clearDragState();
 	}
 
 	// ==================== Drop Processing ====================
 
 	private async processCardDrop(
-		entry: BasesEntry,
+		entries: BasesEntry[],
 		sourceColumnName: string,
 		targetColumnName: string,
-		sourceIndex: number,
 		targetIndex: number
 	): Promise<void> {
-		const groupByProperty = this.callbacks.getGroupByProperty();
-		const sortProperty = this.callbacks.getSortProperty();
-
-		// Moving to different column - update the groupBy property
-		if (sourceColumnName !== targetColumnName) {
-			if (!groupByProperty) {
-				new Notice('Could not detect the group by property for drag and drop');
-				return;
-			}
-
-			// Handle "(No value)" column
-			const newValue = targetColumnName === '(No value)' ? '' : targetColumnName;
-			await this.callbacks.onCardMoveToColumn(entry.file, newValue);
-		} 
-		// Reordering within same column - update sort property if configured
-		else if (sortProperty && sourceIndex !== targetIndex) {
-			// Adjust target index if dragging down (source card will be removed first)
-			let adjustedTargetIndex = targetIndex;
-			if (sourceIndex < targetIndex) {
-				adjustedTargetIndex--;
-			}
-			
-			// Let the view calculate the actual sort value based on neighbors
-			await this.callbacks.onCardReorder(entry.file, targetColumnName, adjustedTargetIndex);
-		}
+		if (entries.length === 0) return;
+		await this.callbacks.onCardDrop(
+			entries.map((entry) => entry.file),
+			sourceColumnName,
+			targetColumnName,
+			targetIndex
+		);
 	}
 
 	// ==================== Visual Indicators ====================
@@ -471,6 +485,11 @@ export class DragDropManager {
 		if (this.dragState?.element) {
 			this.dragState.element.classList.remove('bases-kanban-dragging');
 		}
+		if (this.boardEl) {
+			this.boardEl.querySelectorAll('.bases-kanban-multi-drag-peer').forEach(el => {
+				el.classList.remove('bases-kanban-multi-drag-peer');
+			});
+		}
 
 		// Clear all drag-related classes from board
 		if (this.boardEl) {
@@ -485,5 +504,98 @@ export class DragDropManager {
 		this.hideDropIndicator();
 		this.dragState = null;
 	}
-}
 
+	private handleCardClick(e: MouseEvent, _cardEl: HTMLElement, entry: BasesEntry): void {
+		const filePath = entry.file.path;
+		const modifier = e.metaKey || e.ctrlKey;
+		const rangeSelect = e.shiftKey && this.lastSelectedCardPath !== null;
+
+		if (rangeSelect) {
+			this.selectCardRange(this.lastSelectedCardPath!, filePath, modifier);
+			this.lastSelectedCardPath = filePath;
+			return;
+		}
+
+		if (modifier) {
+			if (this.selectedCardPaths.has(filePath)) {
+				this.selectedCardPaths.delete(filePath);
+			} else {
+				this.selectedCardPaths.add(filePath);
+			}
+			this.lastSelectedCardPath = filePath;
+			this.syncSelectedCardClasses();
+			return;
+		}
+
+		// Default click selects just this card (keeps drag behavior intuitive)
+		this.selectedCardPaths.clear();
+		this.selectedCardPaths.add(filePath);
+		this.lastSelectedCardPath = filePath;
+		this.syncSelectedCardClasses();
+	}
+
+	private getSelectedEntriesForDrag(fallbackEntry: BasesEntry): BasesEntry[] {
+		if (this.selectedCardPaths.size === 0) {
+			return [fallbackEntry];
+		}
+
+		const orderedEntries: BasesEntry[] = [];
+		const seen = new Set<string>();
+		const cardEls = this.boardEl?.querySelectorAll('.bases-kanban-card') ?? [];
+
+		cardEls.forEach((el) => {
+			const cardEl = el as HTMLElement;
+			const filePath = cardEl.dataset.filePath;
+			if (!filePath || !this.selectedCardPaths.has(filePath)) return;
+			if (seen.has(filePath)) return;
+			const entry = (cardEl as HTMLElement & { _basesEntry?: BasesEntry })._basesEntry;
+			if (entry) {
+				orderedEntries.push(entry);
+				seen.add(filePath);
+			}
+		});
+
+		if (!seen.has(fallbackEntry.file.path)) {
+			orderedEntries.push(fallbackEntry);
+		}
+
+		return orderedEntries;
+	}
+
+	private selectCardRange(startPath: string, endPath: string, keepExisting: boolean): void {
+		const orderedPaths = Array.from(this.boardEl?.querySelectorAll('.bases-kanban-card') ?? [])
+			.map((el) => (el as HTMLElement).dataset.filePath)
+			.filter((path): path is string => Boolean(path));
+
+		const startIndex = orderedPaths.indexOf(startPath);
+		const endIndex = orderedPaths.indexOf(endPath);
+		if (startIndex === -1 || endIndex === -1) {
+			if (!keepExisting) {
+				this.selectedCardPaths.clear();
+			}
+			this.selectedCardPaths.add(endPath);
+			this.syncSelectedCardClasses();
+			return;
+		}
+
+		if (!keepExisting) {
+			this.selectedCardPaths.clear();
+		}
+
+		const [from, to] = startIndex < endIndex ? [startIndex, endIndex] : [endIndex, startIndex];
+		for (let i = from; i <= to; i++) {
+			this.selectedCardPaths.add(orderedPaths[i]);
+		}
+		this.syncSelectedCardClasses();
+	}
+
+	private syncSelectedCardClasses(): void {
+		for (const [path, el] of this.selectedCardElements.entries()) {
+			if (!el.isConnected) {
+				this.selectedCardElements.delete(path);
+				continue;
+			}
+			el.classList.toggle('is-selected', this.selectedCardPaths.has(path));
+		}
+	}
+}
