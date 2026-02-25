@@ -138,6 +138,10 @@ export class DragDropManager {
 		this.syncSelectedCardClasses();
 	}
 
+	public getSelectedCardPaths(): string[] {
+		return Array.from(this.selectedCardPaths);
+	}
+
 	// ==================== Column Drag Handlers ====================
 
 	private handleColumnDragStart(

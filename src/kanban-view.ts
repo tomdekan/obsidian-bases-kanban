@@ -238,8 +238,9 @@ export class KanbanView extends BasesView {
 		cardEl.dataset.columnName = columnName;
 		cardEl.dataset.cardIndex = String(cardIndex);
 
-		// Card title (always file name)
-		const titleEl = cardEl.createDiv({ cls: 'bases-kanban-card-title' });
+		// Card title + actions
+		const titleRowEl = cardEl.createDiv({ cls: 'bases-kanban-card-title-row' });
+		const titleEl = titleRowEl.createDiv({ cls: 'bases-kanban-card-title' });
 		const filePath = entry.file.path;
 		
 		const link = titleEl.createEl('a', { 
@@ -249,6 +250,17 @@ export class KanbanView extends BasesView {
 		link.addEventListener('click', (evt) => {
 			evt.preventDefault();
 			void this.app.workspace.openLinkText(filePath, '', evt.ctrlKey || evt.metaKey);
+		});
+
+		const deleteBtn = titleRowEl.createEl('button', {
+			cls: 'bases-kanban-card-delete-btn clickable-icon',
+			attr: { 'aria-label': `Delete card ${entry.file.basename}` },
+		});
+		setIcon(deleteBtn, 'trash-2');
+		deleteBtn.addEventListener('click', (evt) => {
+			evt.preventDefault();
+			evt.stopPropagation();
+			void this.handleDeleteCardSelection(entry);
 		});
 
 		// Render visible properties from the Properties panel
@@ -270,6 +282,29 @@ export class KanbanView extends BasesView {
 
 		// Make card draggable
 		this.dragDropManager.makeCardDraggable(cardEl, entry, columnName, cardIndex);
+	}
+
+	private async handleDeleteCardSelection(clickedEntry: BasesEntry): Promise<void> {
+		const selectedPaths = new Set(this.dragDropManager.getSelectedCardPaths());
+		const selectedIncludesClicked = selectedPaths.has(clickedEntry.file.path);
+		const entriesToDelete = selectedIncludesClicked
+			? this.getEntriesInBoardOrder().filter((entry) => selectedPaths.has(entry.file.path))
+			: [clickedEntry];
+		const uniqueEntries = entriesToDelete.length > 0 ? entriesToDelete : [clickedEntry];
+		const count = uniqueEntries.length;
+		const message = count === 1
+			? `Delete "${clickedEntry.file.basename}"?`
+			: `Delete ${count} selected cards?`;
+		if (!window.confirm(message)) {
+			return;
+		}
+
+		for (const entry of uniqueEntries) {
+			await this.app.fileManager.trashFile(entry.file);
+		}
+
+		this.dragDropManager.clearCardSelection();
+		new Notice(count === 1 ? 'Deleted card.' : `Deleted ${count} cards.`);
 	}
 
 	private renderPropertyRow(container: HTMLElement, propId: BasesPropertyId, value: Value): void {
