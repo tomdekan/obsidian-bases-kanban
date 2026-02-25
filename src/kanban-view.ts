@@ -99,8 +99,8 @@ export class KanbanView extends BasesView {
 			return;
 		}
 
-		// Detect the groupBy property from the data (uses Bases groupBy configuration)
-		this.groupByProperty = this.detectGroupByProperty(groupedData);
+		// Detect the groupBy property from data; fall back to configured groupBy for empty boards
+		this.groupByProperty = this.detectGroupByProperty(groupedData) ?? this.getConfiguredGroupByProperty();
 		this.currentGroups = sortedGroups;
 
 		// Render the kanban board
@@ -406,8 +406,9 @@ export class KanbanView extends BasesView {
 			
 			// Create file with frontmatter if we have a column value
 			let content = '';
-			if (columnValue !== null && this.groupByProperty) {
-				content = `---\n${this.groupByProperty}: ${columnValue}\n---\n\n`;
+			const groupByProperty = this.getGroupByPropertyFromConfig();
+			if (columnValue !== null && groupByProperty) {
+				content = `---\n${groupByProperty}: ${columnValue}\n---\n\n`;
 			}
 			
 			const file = await this.app.vault.create(fullPath, content);
@@ -423,7 +424,7 @@ export class KanbanView extends BasesView {
 	}
 
 	private handleAddColumn(): void {
-		const groupByProperty = this.groupByProperty;
+		const groupByProperty = this.getGroupByPropertyFromConfig();
 		
 		// If we can't detect the groupBy property, prompt for it
 		if (!groupByProperty) {
@@ -776,7 +777,21 @@ export class KanbanView extends BasesView {
 	 * Get the groupBy property name (detected from data)
 	 */
 	private getGroupByPropertyFromConfig(): string | null {
-		return this.groupByProperty;
+		return this.groupByProperty ?? this.getConfiguredGroupByProperty();
+	}
+
+	private getConfiguredGroupByProperty(): string | null {
+		const groupByConfig = this.config?.get('groupBy');
+		if (!groupByConfig || typeof groupByConfig !== 'object') {
+			return null;
+		}
+
+		const propertyValue = (groupByConfig as { property?: unknown }).property;
+		if (typeof propertyValue !== 'string' || propertyValue.length === 0) {
+			return null;
+		}
+
+		return propertyValue.startsWith('note.') ? propertyValue.substring(5) : propertyValue;
 	}
 
 	/**
